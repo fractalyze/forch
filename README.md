@@ -128,5 +128,4 @@ forch/testing/              absltest suites: oracle byte-match, trace counts, sp
 benchmarks/handwritten/     the reference CUDA kernel + golden harness (not a product path)
 benchmarks/ntt_bench.py     opcode-path timings; run_all.sh for the full table
 docs/gap-analysis.md        where codegen loses today, as filed-issue drafts
-docs/superpowers/           design spec and implementation plan
 ```
