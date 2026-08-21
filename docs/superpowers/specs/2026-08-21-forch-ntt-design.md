@@ -1,237 +1,159 @@
-# forch — negacyclic NTT for CKKS-scale rings on GPU (v0 design)
+# forch v0 — polynomial multiplication that compiles to a fast NTT
 
-Date: 2026-08-21. Status: approved approach (out-of-tree CUDA FFI, NTT-only
-scope, OpenFHE 60/50 + HEaaN 58/42 prime sets); this document is the design
-to implement.
+Date: 2026-08-21 (rev 2 — the handwritten kernel demoted from product path to
+reference baseline, per review). Status: approved direction; this is the
+design to implement.
 
 ## 1. Purpose
 
 forch is the FHE *evaluation* layer planned above `lattice-frx` ("PyTorch for
-FHE": mult / relinearization / rotation / bootstrapping over ciphertexts —
-nothing that touches a secret key). Its first and smallest deliverable is the
-operation every one of those is made of: the negacyclic NTT over
-`Z_q[X]/(X^N + 1)` at CKKS scale (`N = 2^16`, `q < 2^60`), written the way
-the FHE literature writes it, running on an RTX 5090, with a number and a
-readable kernel to show for it.
+FHE"). Its v0 makes one point, the same point the rest of the zorch stack
+makes about ZK kernels: **you write plain Python, it compiles through the
+`ntt` opcode's GPU codegen, and that generated code is (to be made) as fast
+as a handwritten FHE kernel.**
 
-v0 answers one question: **how fast is a CKKS-parameter NTT on an RTX 5090
-when the known FHE tricks are applied, and what does that code look like** —
-measured against the stack's existing `frx.lax.ntt` on the same card in the
-same process.
+Three deliverables, one repo:
 
-Out of scope for v0: CKKS itself (encoder, encrypt, mult, rescale,
-key-switch), any change to `lattice-frx` or `xla`, Pallas variants, 32-bit
-RNS (Cheddar-style), tensor-core NTTs, ring degrees other than `2^16`.
+1. **The API**: a `Poly` you can just multiply — `a * b` inserts the
+   NTT/domain moves itself, everything traces into one XLA graph. No tables,
+   no FFI, no transform calls in user code.
+2. **The reference**: a minimal handwritten CUDA NTT (the FHE literature's
+   design: Shoup + Harvey lazy + ψ^brev tables, two kernels) as a standalone
+   benchmark binary — the "this is what hand-tuned looks like, and this is
+   its speed" bar. It is *not* wired into the product path.
+3. **The comparison**: one table on one RTX 5090 — handwritten vs the opcode
+   path (raw and in contract order) vs roofline vs published numbers — plus
+   a gap analysis filed as `fractalyze/xla` issues (Shoup/lazy butterflies,
+   native bit-reversed emission). Closing the gap is follow-up work in xla,
+   not in this repo.
+
+Out of scope for v0: CKKS itself (encode/encrypt/rescale/key-switch), any
+xla emitter change, Pallas variants, 32-bit RNS, tensor cores, ring degrees
+other than `2^16` in the benchmark (the API inherits whatever `RnsRing`
+accepts).
 
 ## 2. Where it sits
 
 ```
 hash-frx   lattice-frx  <- substrates
     \        /    \
-   enc-frx ------ forch  <- function layers (enc-frx: keys; forch: eval keys only)
+   enc-frx ------ forch  <- function layers (enc-frx: secret keys; forch: eval only)
 ```
 
-forch depends on `lattice-frx` (ring types, primes, roots, the exact host
-ring as oracle), `frx` + `frx-cuda12-plugin` (arrays, `frx.ffi`), `zk-dtypes`
-(field dtypes), `numpy`. It never depends on `enc-frx`/`sig-frx`, and it does
-not reach into `xla` — the kernel is an out-of-tree shared object registered
-through `frx.ffi`, so no XLA build is involved.
+Dependencies: `lattice-frx` (ring, primes, roots, exact host oracle), `frx`
++ `frx-cuda12-plugin`, `zk-dtypes`, `numpy`. No dependency on `xla` source,
+no custom calls, no scheme repos. The handwritten reference builds with
+plain `nvcc` and links nothing from the stack.
 
-## 3. Contract
+## 3. The API (`forch/`)
 
 ```python
-ring = lattice_frx.ring.RnsRing(q_moduli, d=1 << 16)     # limbs q_i ≡ 1 mod 2^17, q_i < 2^60
-plan = forch.ntt.NttPlan(ring)                           # builds + uploads per-limb tables once
-eval_ = plan.ntt(coeff)     # Coeff -> Eval, lattigo (bit-reversed) order, == HostRnsRing.ntt
-coeff = plan.intt(eval_)    # Eval  -> Coeff, includes 1/N,                  == HostRnsRing.intt
+import forch
+ring = forch.Ring(q_moduli, d=1 << 16)      # thin wrapper over lattice_frx.ring.RnsRing
+a = ring.from_signed(coeffs)                 # or ring.poly(host_u64[limbs, d])
+c = a * b                                    # NTT both sides, pointwise mul — automatic
+d = c + a                                    # domain coercion automatic
+d.coeffs()                                   # -> host [limbs, d], canonical residues
 ```
 
-- Input/output types are `lattice_frx.ring.Coeff` / `Eval` (tuple of per-limb
-  field arrays, `[..., d]`, leading axes are batch). Same values, same order,
-  same `1/d` convention as `RnsRing.ntt/intt` and `HostRnsRing`. The order
-  comes out of the kernel natively (CT-DIT forward emits bit-reversed order;
-  GS-DIF inverse consumes it) — there is no permutation anywhere.
-- Limb arrays are handed to the kernel by `lax.bitcast_convert_type` to raw
-  words and back. The field dtype's storage may be Montgomery; the kernel
-  does not care, because every multiplication in the transform is "data ×
-  constant twiddle" (Shoup), which is representation-agnostic: `NTT(x·R) =
-  NTT(x)·R`. Twiddle tables are plain residues.
-- Output residues are fully reduced to `[0, q)` (the canonical contract of
-  `lattice-frx`); the lazy `[0, 4q)` range exists only inside the kernel.
-- Supported: `d == 2^16` exactly, `q < 2^60`, `q ≡ 1 (mod 2^17)`. Anything
-  else raises `ValueError` at `NttPlan` construction, naming the bound. The
-  60-bit cap is Harvey's `4q < 2^62` headroom plus the same margin every FHE
-  library keeps (SEAL/OpenFHE/Phantom/HEonGPU cap at 60).
-- `d` other than `2^16` is a deliberate v0 restriction, not a design limit:
-  the split below generalises to `N1 = 2^8, N2 = N/2^8`.
+- `Poly` carries `Coeff` and/or `Eval` from `lattice_frx.ring`, converting
+  lazily and caching both forms. Domain bookkeeping happens in Python at
+  trace time — consistent with lattice-frx's "the domain is a type, not a
+  runtime flag": forch only decides *which* statically-typed op to emit.
+- `*` computes in Eval (`ring.mul`), `+`/`-` in whichever domain both
+  operands already share (preferring the one that inserts no transform);
+  `mul_add` fuses where the expression allows.
+- Everything composes under `frx.jit`; the README shows the resulting HLO
+  contains `ntt` fusions and the whole `a * b + c` is one compiled zone.
+- Correctness oracle: `HostRnsRing` (negacyclic schoolbook on exact ints via
+  its own `ntt`; plus an `O(d²)` naive negacyclic mul at small `d` to keep
+  the oracle honest).
 
-## 4. Kernel design
+## 4. The handwritten reference (`benchmarks/handwritten/`)
 
-Per limb, per call: two CUDA kernels, forward or inverse, over a flattened
-`[batch, 65536]` u64 buffer. The `2^16`-point transform is decomposed as
-`2^8 × 2^8`; each `2^8`-point sub-transform is done by **one warp holding 8
-elements per lane in registers**, so the only synchronisation inside a
-sub-transform is `__syncwarp()`.
+Standalone CUDA17 binary (`Makefile`, `nvcc -arch=sm_120`), no Python, no
+FFI. Design per `study/fhe/ntt/techniques.md`:
 
-### 4.1 Arithmetic — Shoup multiply, Harvey lazy butterflies
-
-Precomputed per twiddle `w`: `w' = ⌊w · 2^64 / q⌋`.
-
-```
-mul_shoup(x, w, w'):  hi = __umul64hi(x, w');  r = x*w - hi*q;   // r ∈ [0, 2q)
-CT (forward):  if (x ≥ 2q) x -= 2q;  t = mul_shoup(y, w, w');  x' = x + t;  y' = x - t + 2q;   // in/out [0, 4q)
-GS (inverse):  u = x + y; if (u ≥ 2q) u -= 2q;  v = mul_shoup(x - y + 2q, w, w');               // in/out [0, 2q)
-```
-
-Forward input is `[0, q)`, kept in `[0, 4q)` across the 16 stages; the store
-reduces with two conditional subtractions. Inverse keeps `[0, 2q)`. `N⁻¹` is
-folded into the inverse's last-stage twiddle (the `x+y` half still takes one
-`mul_shoup` by `N⁻¹`, as OpenFHE does after issue #872). Reference: Harvey,
-JSC 2014 (arXiv 1205.2926); Longa–Naehrig, CANS 2016 (eprint 2016/504).
-
-### 4.2 Tables — ψ^brev, twist merged, no bit-reversal
-
-`ψ = g^((q−1)/2N)` with `g = lattice_frx.roots.primitive_root(q, …)` — the
-same generator `RnsRing` hands `lax.ntt`, so the root (and therefore every
-value) is identical to `HostRnsRing`, not merely "an" NTT.
-
-Per limb, four `u64[N]` tables: `T[brev(i)] = ψ^i`, its Shoup companion,
-`Tinv[brev(i)] = ψ^(−i)`, its Shoup companion (2 MB per limb, built on the
-host with Python integers, uploaded once per `NttPlan`). Indexing the CT
-butterflies of stage `s` (`m = 2^s`) at group `i` with `T[m + i]` merges the
-negacyclic twist into the transform (Roy et al. CHES 2014; Pöppelmann–Oder–
-Güneysu 2015), and is the same table OpenFHE
-(`transformnat-impl.h:730-738`), SEAL, HEXL, Lattigo and Phantom build.
-
-### 4.3 Two phases, twist-free (verified numerically against `HostRnsRing`)
-
-With that table the `2^8 × 2^8` split needs **no inter-phase twiddle
-multiply** — both phases are plain 256-point CT-DIT transforms over different
-slices of the same table:
-
-- **Phase 1** (stages 0–7): column `j ∈ [0, 256)` = elements `{j + 256·k}`,
-  twiddle for local stage `m'`, group `i'` = `T[m' + i']` (identical for every
-  column).
-- **Phase 2** (stages 8–15): contiguous chunk `c ∈ [0, 256)` = elements
-  `[256c, 256c + 256)`, twiddle = `T[m'·(256 + c) + i']`.
-
-The inverse mirrors it (GS-DIF, phase order reversed, `Tinv`). Checked in
-Python against `HostRnsRing.ntt` at `q = 2^60 − 2^18 + 1` before this spec
-was written; the same check becomes a unit test.
-
-### 4.4 Memory movement
-
-- **Phase 1 kernel**: a block owns `T_cols` adjacent columns (`T_cols ∈ {8,
-  16, 32}`, template parameter, tuned by the benchmark), i.e. a
-  `256 × T_cols` tile whose rows are contiguous `8·T_cols` bytes in global
-  memory — loaded coalesced into padded shared memory (row stride
-  `T_cols + 1` words to break 64-bit bank conflicts), then warp `w` runs the
-  256-point transform on column `w` from shared memory with 8 elements per
-  lane, and the tile is stored back the same way. Block = `32 · T_cols`
-  threads; shared = `256 · (T_cols + 1) · 8` bytes (`T_cols = 16` → 34 KB,
-  512 threads, 2–3 blocks per sm_120 SM).
-- **Phase 2 kernel**: a block owns `W` consecutive chunks (`W ∈ {4, 8}`), each
-  warp loads its 256 contiguous elements directly (8 per lane, fully
-  coalesced), transforms in registers + a small per-warp shared scratch for
-  the two intra-warp exchanges, and stores in place.
-- Inside a 256-point warp transform the 8 stages are: radix-8 in registers
-  (3 stages) → shared exchange → radix-8 (3) → shared exchange → radix-4 (2),
-  with `__syncwarp()` between — no block-wide barriers after the initial tile
-  load.
-- Grid = `batch × 256 / T_cols` (phase 1) and `batch × 256 / W` (phase 2)
-  blocks; the batch axis is the only thing that fills the 170 SMs, which is
-  why the benchmark sweeps it.
-- DRAM traffic: 2 × (read + write) = 2 MB per NTT if the 512 KB intermediate
-  is evicted, 1 MB if it stays in the 96 MB L2 (it will for batch ≤ 64).
-  Twiddle traffic is 1 MB per limb per direction but L2-resident across the
-  batch. Roofline on 1,792 GB/s: **0.585 µs (1 MB) – 1.17 µs (2 MB)** per
-  NTT.
-
-### 4.5 FFI binding
-
-One XLA FFI handler per direction, registered under `platform="CUDA"` via
-`frx.ffi.register_ffi_target`, bound with `Ffi::Bind().Ctx<PlatformStream<
-cudaStream_t>>().Arg<Buffer>(x).Arg<Buffer>(table).Arg<Buffer>(shoup)
-.Ret<Buffer>(y).Attr<uint64_t>("q")...`. Words travel as the dtype `frx`
-exposes without x64 (`uint32[..., 2]` pairs); the handler reinterprets the
-buffer as `u64`. The Python side wraps `frx.ffi.ffi_call(...)` with
-`vmap_method="broadcast_all"` so leading axes batch. Built with CMake +
-nanobind after `jax/examples/ffi` (scikit-build-core, `nvcc` for sm_120),
-against `frx.ffi.include_dir()`.
+- **Arithmetic**: Shoup multiply (`w' = ⌊w·2^64/q⌋`, `__umul64hi`) with
+  Harvey lazy ranges — forward CT butterflies in `[0, 4q)`, inverse GS in
+  `[0, 2q)`, one full reduction at the store; `q < 2^60`.
+- **Tables**: `T[brev(i)] = ψ^i` and Shoup companions, ψ from the same
+  primitive-root walk as `lattice_frx.roots` (lattigo's), so values match
+  the oracle byte-exactly, twist merged, order native (CT forward: natural →
+  bit-reversed = the lattice-frx contract order; GS inverse: back).
+- **Structure**: `2^16 = 2^8 × 2^8`, two kernels. Phase 1: a block loads a
+  `256 × T_cols` strided tile coalesced into padded shared memory, one warp
+  per column runs a 256-pt transform with 8 elements/lane in registers
+  (radix-8 → exchange → radix-8 → exchange → radix-4, `__syncwarp` only),
+  twiddles `T[m'+i']`. Phase 2: contiguous chunks, same warp routine,
+  twiddles `T[m'·(256+c)+i']` — the split is twist-free with this table
+  (verified against `HostRnsRing` numerically; the check ships as a test).
+  `T_cols ∈ {8,16,32}` and chunks-per-block `W ∈ {4,8}` are compile-time
+  sweep parameters.
+- **Harness**: golden vectors dumped by a small Python script
+  (`make_golden.py`, uses `HostRnsRing`) into flat files; the binary loads
+  them, checks byte-exact forward/inverse/round-trip, then times with CUDA
+  events: batch ∈ {1, 16, 64, 256}, primes {`2^60−2^18+1`,
+  `FirstPrime(50)`, `LastPrime(58)`, `LastPrime(42)`} — the OpenFHE-default
+  and HEaaN-FGb shapes.
+- Roofline on 1,792 GB/s: 0.585 µs/NTT (intermediate in L2) – 1.17 µs
+  (spilled); literature scaled from Ada: 0.9–1.2 µs. If the handwritten
+  kernel can't beat the opcode's 1.42 µs it is not a bar, and the design is
+  revisited before any number is quoted.
 
 ## 5. Verification
 
-`absltest` suite, `forch/testing/ntt_test.py`, GPU required:
+`absltest`, `forch/testing/`:
 
-1. `ntt == HostRnsRing.ntt` and `intt == HostRnsRing.intt`, byte-exact, random
-   inputs, for each prime in the benchmark set (60, 50, 58, 42 bit), batch 1
-   and batch 3.
-2. `intt(ntt(x)) == x` and `ntt(intt(y)) == y`.
-3. Agreement with `RnsRing.ntt` (the `lax.ntt` path) — the two GPU paths
-   must coincide.
-4. Outputs canonical: every residue `< q` (exercises the final reduction),
-   on all-zero, all-`q−1`, and random inputs (the `q−1` case is the lazy
-   overflow probe).
-5. Montgomery-stored limbs (`RnsRing.coeff_from_host`) and `storage="std"`
-   limbs both round-trip.
-6. `NttPlan` rejects `q ≥ 2^60`, `q ≢ 1 mod 2^17`, and `d ≠ 2^16` with
-   `ValueError` naming the rule.
-7. The pure-Python 2-phase split check from §4.3 (CPU-only, keeps the
-   algebra pinned independently of the kernel).
+1. `(a * b).coeffs() == ` exact negacyclic product from `HostRnsRing`
+   (its NTT path), random inputs, primes 60/50/58/42-bit, batch 1 and 3;
+   plus `O(d²)` naive check at `d = 64`.
+2. Domain bookkeeping: `+` after `*` inserts no extra transform (count `ntt`
+   ops in the jaxpr/HLO text); explicit `.ntt()`/`.intt()` round-trip.
+3. `Poly` under `frx.jit`: one compiled call, same bytes as eager.
+4. Handwritten binary: golden forward/inverse/round-trip gates run by
+   `make check` (CUDA-capable CI/host only), including the all-`q−1` lazy
+   overflow probe and canonical (`< q`) outputs.
+5. The pure-Python two-phase split check (CPU, pins the §4 algebra).
 
-## 6. Benchmark and report
+## 6. Benchmark and report (`benchmarks/`, `README.md`)
 
-`benchmarks/ntt_bench.py`, one process, warm, `block_until_ready` timing
-over ≥30 reps, reporting µs/NTT and effective GB/s on the 1 MB model:
+One table, same card, same day: handwritten fwd/inv · `lax.ntt` raw ·
+`lax.ntt` + `lax.bit_reverse` · `RnsRing.ntt` (today's `fnp.take` path) ·
+`Poly.__mul__` end-to-end (2×NTT + pointwise, per-NTT amortized) — µs/NTT
+and effective GB/s, batch and prime sweeps as in §4, one `nsys` capture.
+Already measured for context: opcode raw 1.42 µs, contract order 2.77 µs.
 
-- paths: forch forward / inverse; `lax.ntt` raw; `lax.ntt` + `lax.bit_reverse`;
-  `RnsRing.ntt` (the `fnp.take` adapter) — all on the same arrays.
-- sweep: batch ∈ {1, 16, 64, 256}; primes {`2^60−2^18+1`, `FirstPrime(50)`,
-  `LastPrime(58)`, `LastPrime(42)`}; `T_cols` / `W` variants for forch.
-- one `nsys` capture of the batch-64 case for per-kernel device time.
-- the README carries the resulting table, the already-measured baseline
-  (`lax.ntt` 1.42 µs raw / 2.77 µs in contract order), the roofline, and an
-  annotated walkthrough of `ntt.cu` (butterfly, table indexing, the two
-  phases) — the "what does the code look like" half of the deliverable.
-
-Expected from the literature (Phantom 1.52 µs/limb on a 4090 at 1,008 GB/s,
-scaled by bandwidth): **0.9–1.2 µs/NTT**. Anything above 1.4 µs means the
-kernel lost to the generic one and the design is revisited before any
-claim is made.
+README also carries: an annotated walkthrough of the handwritten kernel
+(the butterfly, the table indexing, the two phases) beside the HLO the
+opcode path generates for `a * b` — the "what does the code look like" half
+of the deliverable — and the gap analysis: which of {Shoup, lazy ranges,
+native brev order, table-vs-window twiddles} the emitter lacks, each filed
+as a `fractalyze/xla` issue with the measured delta it should recover, and
+the `lattice-frx` `fnp.take` → `lax.bit_reverse` issue (−0.6 µs measured).
 
 ## 7. Repository layout
 
 ```
 forch/
-  forch/__init__.py
-  forch/ntt/__init__.py        # NttPlan, ntt, intt
-  forch/ntt/tables.py          # per-limb ψ^brev + Shoup tables (host, exact ints)
-  forch/ntt/_ffi.py            # frx.ffi registration + ffi_call wrappers
-  forch/ntt/kernels/ntt.cu     # the two kernels, both directions
-  forch/ntt/kernels/ffi.cc     # XLA FFI handlers + nanobind module
-  forch/testing/ntt_test.py
-  benchmarks/ntt_bench.py
-  CMakeLists.txt, pyproject.toml (scikit-build-core)
-  README.md, CLAUDE.md, LICENSE (Apache-2.0)
-  docs/superpowers/specs/…     # this file
+  forch/__init__.py            # Ring, Poly
+  forch/testing/poly_test.py, split_test.py
+  benchmarks/handwritten/ntt.cu, harness.cu, Makefile, make_golden.py
+  benchmarks/ntt_bench.py      # opcode-path + Poly timings
+  README.md, CLAUDE.md, LICENSE (Apache-2.0), pyproject.toml
+  docs/superpowers/specs/…
 ```
 
-Bazel wiring (the org's other repos build hermetically) is a follow-up once
-the kernel and numbers exist; v0 installs with `pip install -e .` from the
-same Fractalyze index `lattice-frx` uses.
+Pure-Python package (`pip install -e .` — no build step); the handwritten
+reference builds only where CUDA exists. Bazel wiring: follow-up.
 
-## 8. Risks and what decides them
+## 8. Risks / open edges
 
-- **FFI word type**: if `frx.ffi` refuses `uint32[..., 2]` buffers or
-  `bitcast_convert_type` is not free under `jit`, fall back to enabling x64
-  inside forch only, after checking `lattice-frx`'s "no x64" assumption
-  still holds for field arrays. First task of the plan is this round-trip.
-- **8 elements/lane spills** at 64-bit (FIDESlib fell back to radix-2 for
-  this reason): checked with `-Xptxas -v`; the fallback is radix-4 per lane
-  (4 elements), same structure.
-- **Phase-1 tile load dominates** (strided side): `T_cols` sweep; if 32-word
-  rows are needed for bandwidth, shared memory goes to 66 KB and occupancy
-  to one block per SM — the benchmark decides.
-- **Occupancy vs. batch**: batch 1 is one limb = 256 blocks, under-filling
-  170 SMs × several blocks — reported as is, batch ≥ 16 is the honest
-  number for CKKS (a ciphertext has dozens of limbs).
+- 8 elements/lane at 64-bit may spill (FIDESlib's reason for radix-2):
+  `-Xptxas -v` gate; fallback radix-4/lane, same structure.
+- Phase-1 strided tile may need `T_cols = 32` (66 KB smem, 1 block/SM) for
+  bandwidth — the sweep decides, occupancy noted in the report.
+- Batch 1 under-fills 170 SMs on both paths — reported as-is; batch ≥ 16 is
+  the honest CKKS number (a ciphertext is dozens of limbs).
+- `Poly` fusion behavior (does XLA fuse pointwise mul into the NTT store?) is
+  observed and reported, not engineered, in v0.
