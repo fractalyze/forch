@@ -108,8 +108,10 @@ FFI. Design per `study/fhe/ntt/techniques.md`:
 1. `(a * b).coeffs() == ` exact negacyclic product from `HostRnsRing`
    (its NTT path), random inputs, primes 60/50/58/42-bit, batch 1 and 3;
    plus `O(d²)` naive check at `d = 64`.
-2. Domain bookkeeping: `+` after `*` inserts no extra transform (count `ntt`
-   ops in the jaxpr/HLO text); explicit `.ntt()`/`.intt()` round-trip.
+2. Domain bookkeeping: a reused operand transforms once (caching); `+` after
+   `*` costs at most the one transform that embeds the coeff-only operand
+   into Eval (the storage domain FHE schemes use — meeting in Coeff instead
+   would penalize every continued product); counts asserted on the jaxpr.
 3. `Poly` under `frx.jit`: one compiled call, same bytes as eager.
 4. Handwritten binary: golden forward/inverse/round-trip gates run by
    `make check` (CUDA-capable CI/host only), including the all-`q−1` lazy
