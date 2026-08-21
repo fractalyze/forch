@@ -39,14 +39,15 @@ custom kernels around it.
 
 ## Results (RTX 5090, d = 2^16, 60-bit prime, µs per NTT, warm)
 
-<!-- BENCH_TABLE_START: numbers from benchmarks/results/2026-08-21-rtx5090 -->
+<!-- BENCH_TABLE_START: benchmarks/results/2026-08-21-rtx5090 (quiet GPU) -->
 | path | batch 1 | 16 | 64 | 256 |
 |---|---|---|---|---|
-| handwritten fwd | 20.9 | 1.78 | **1.33** | 1.55 |
-| handwritten inv | 20.6 | 1.78 | **1.37** | 1.55 |
-| `lax.ntt` raw fwd (natural order) | ~20 | 2.2–2.6 | 1.6–1.8 | 1.8–2.2 |
-| `lax.ntt` + `lax.bit_reverse` (contract order) | ~20 | 2.7 | 2.4 | 3.4 |
-| `RnsRing.ntt` today (`fnp.take` adapter) | ~25 | 3.0 | 2.7 | 2.7 |
+| handwritten fwd | 21.2 | 1.78 | **1.35** | 1.54 |
+| handwritten inv | 20.7 | 1.78 | **1.37** | 1.55 |
+| `lax.ntt` raw fwd (natural order) | 20.5 | 2.53 | 1.64 | 1.96 |
+| `lax.ntt` raw inv | 17.9 | 2.22 | 1.63 | 1.67 |
+| `lax.ntt` + `lax.bit_reverse` (contract order) | 20.8 | 2.71 | 2.15 | 2.91 |
+| `RnsRing.ntt` today (`fnp.take` adapter) | 19.4 | 2.88 | 2.23 | 2.30 |
 <!-- BENCH_TABLE_END -->
 
 - Roofline: the two-kernel design moves 2 MB of DRAM per NTT (measured: the
@@ -57,7 +58,7 @@ custom kernels around it.
   170 SMs) — batch ≥ 16 is the honest CKKS regime, since a ciphertext is
   dozens of limbs. Published context: Phantom ≈1.5 µs/limb and GPU-NTT
   8.7 µs single on an RTX 4090 (1,008 GB/s).
-- A 25-limb (HEaaN-FGb-shaped) `Poly` product amortizes to **~13 µs/NTT**
+- A 25-limb (HEaaN-FGb-shaped) `Poly` product amortizes to **12.7 µs/NTT**
   today: per-limb dtypes force batch-1 transforms. That ~10× — not the ~20%
   butterfly arithmetic — is the real opcode-vs-handwritten gap, and the top
   item in [docs/gap-analysis.md](docs/gap-analysis.md).

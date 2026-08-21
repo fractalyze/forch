@@ -6,13 +6,13 @@ Handwritten = `benchmarks/handwritten/ntt.cu` (Shoup + Harvey lazy + ψ^brev,
 two kernels, warp-per-256-pt). Opcode = `frx.lax.ntt` (NEGACYCLIC), the
 generated `ntt_pass` fusions. Exact tables in `benchmarks/results/`.
 
-| path (batch 64, µs/NTT) | fwd | inv |
+| path (batch 64, µs/NTT, quiet GPU) | fwd | inv |
 |---|---|---|
-| handwritten | **1.33** | **1.37** |
-| `lax.ntt` raw (natural order out) | 1.6–1.8 | 1.7–1.8 |
-| `lax.ntt` + `lax.bit_reverse` (contract order) | 2.4 | — |
-| `RnsRing.ntt` today (`fnp.take` adapter) | 2.7 | — |
-| `Poly` product on a 25-limb ring, amortized | **~13** | — |
+| handwritten | **1.35** | **1.37** |
+| `lax.ntt` raw (natural order out) | 1.64 | 1.63 |
+| `lax.ntt` + `lax.bit_reverse` (contract order) | 2.15 | — |
+| `RnsRing.ntt` today (`fnp.take` adapter) | 2.23 | — |
+| `Poly` product on a 25-limb ring, amortized | **12.7** | — |
 
 Roofline: the two-kernel design moves 2 MB/NTT of DRAM traffic (the L2 does
 NOT retain the 32 MB intermediate at batch 64 — apparent per-kernel bandwidth
@@ -37,13 +37,13 @@ Recovers ~10× on ring-element products at CKKS limb counts, which is the
 shape every consumer (jindo commit, future forch mult/key-switch) actually
 runs. This is the highest-value item on the list.
 
-### 2. Order adapter: 2.7 → 1.33 µs (2.1×) against the contract order
+### 2. Order adapter: 2.23 → 1.35 µs (1.65×) against the contract order
 
 The FHE convention keeps the NTT domain bit-reversed (every CPU and GPU FHE
 library surveyed; lattice-frx's contract order IS lattigo's bit-reversed
 table order). The opcode emits natural order, so `RnsRing.ntt` pays a full
-gather (`fnp.take`, +1.35 µs — as expensive as the transform) or, best case,
-a `lax.bit_reverse` kernel (+0.6 µs) that the rewriter's DIF fold cannot
+gather (`fnp.take`, +0.6 µs quiet / +1.35 µs contended) or, best case,
+a `lax.bit_reverse` kernel (+0.5 µs) that the rewriter's DIF fold cannot
 elide because `NEGACYCLIC_*` is pinned to CT-DIT
 (`ntt_fusion_rewriter.cc:748-790` recognizes a `kBitReverse` consumer only
 for the cyclic types).
@@ -55,7 +55,7 @@ natively, exactly as the handwritten kernel does; no permutation anywhere.
 `lax.bit_reverse` instead of `fnp.take` (−0.5–0.6 µs/NTT measured, and it
 becomes a no-op the day the opcode grows the native mode).
 
-### 3. Butterfly arithmetic: raw 1.6–1.8 vs 1.33 µs (~20%)
+### 3. Butterfly arithmetic: raw 1.64 vs 1.35 µs (~18%)
 
 The generated kernel multiplies via Montgomery REDC (PrimeIR's choice for a
 parametric 64-bit field) and fully reduces every butterfly; the handwritten
@@ -84,19 +84,19 @@ table layout, so the companion row is one more precompute.
 Drafts to file (pending owner's go-ahead), self-contained per playbook §11:
 
 1. **xla: batch the RNS limb axis through one NTT call** — problem: per-limb
-   dtypes force batch-1 NTTs; measured 20 µs/NTT batch-1 vs 1.3–1.8 µs
-   batched on RTX 5090 at d=2^16; a 25-limb product amortizes to ~13 µs/NTT.
+   dtypes force batch-1 NTTs; measured ~20 µs/NTT batch-1 vs 1.35–1.64 µs
+   batched on RTX 5090 at d=2^16; a 25-limb product amortizes to 12.7 µs/NTT.
    Sketch: accept `[limbs, ..., d]` with a per-limb modulus list on the type
    or a new stacked type; twiddle constant becomes `[limbs, table]`; grid
    flattens `limbs × batch`. Acceptance: 25-limb product within 1.5× of the
    equal-traffic single-modulus batched call.
 2. **xla: native bit-reversed order for the negacyclic NTT** — problem: the
-   FHE/lattigo contract order costs a gather (2.7 µs total) or an extra
-   kernel (2.4 µs) against 1.42 µs raw; CT-DIT with ψ^brev tables emits
+   FHE/lattigo contract order costs a gather (2.23 µs total) or an extra
+   kernel (2.15 µs) against 1.64 µs raw; CT-DIT with ψ^brev tables emits
    bit-reversed for free. Acceptance: `RnsRing.ntt`-shaped call ==
    handwritten order with no permutation op in the HLO.
 3. **lattice-frx: `fnp.take` → `lax.bit_reverse` in `RnsRing.ntt/intt`** —
-   measured −0.5–0.6 µs/NTT today; forward-compatible with (2).
+   measured −0.1–0.6 µs/NTT depending on contention; forward-compatible with (2).
 4. **(stretch, xla) Shoup/lazy butterflies for ≤60-bit parametric fields** —
    ~20% on the raw transform; only worth scheduling after (1) and (2), which
    dominate.
