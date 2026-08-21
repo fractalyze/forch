@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forch"
+version = "0.0.1"
+description = "forch — FHE evaluation layer on the lattice-frx substrate: write the polynomial arithmetic, the compiler does the NTT."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+authors = [{ name = "The forch Authors" }]
+# lattice-frx carries the ring and pins its own frx/zk-dtypes floor; forch
+# adds nothing below it. Install with
+# --extra-index-url=https://fractalyze.github.io/pypi/simple/
+dependencies = ["numpy", "lattice-frx"]
+
+[project.optional-dependencies]
+dev = ["absl-py"]
+cuda = ["frx-cuda12-plugin"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forch*"]
+exclude = ["forch.testing", "forch.testing.*"]

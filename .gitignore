@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.egg-info/
+benchmarks/handwritten/golden/
+benchmarks/handwritten/ntt_bench
+benchmarks/results/**/*.nsys-rep
+docs/superpowers/

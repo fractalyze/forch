@@ -1,0 +1,22 @@
+# frx 0.10.2, [CudaDevice(id=0)], d = 2^16, 30 reps warm
+
+| path | prime | batch 1 | batch 16 | batch 64 | batch 256 |
+|---|---|---|---|---|---|
+| lax.ntt raw fwd | q60 | 20.54 | 2.53 | 1.64 | 1.96 |
+| lax.ntt raw inv | q60 | 17.90 | 2.22 | 1.63 | 1.67 |
+| lax.ntt + bit_reverse | q60 | 20.82 | 2.71 | 2.15 | 2.91 |
+| RnsRing.ntt (take) | q60 | 19.38 | 2.88 | 2.23 | 2.30 |
+| lax.ntt raw fwd | q50 | 19.36 | 2.26 | 1.48 | 1.56 |
+| lax.ntt raw inv | q50 | 18.88 | 2.18 | 1.64 | 1.67 |
+| lax.ntt + bit_reverse | q50 | 21.95 | 2.66 | 2.15 | 2.91 |
+| RnsRing.ntt (take) | q50 | 22.59 | 2.85 | 2.23 | 2.29 |
+| lax.ntt raw fwd | q58 | 16.63 | 2.07 | 1.48 | 1.56 |
+| lax.ntt raw inv | q58 | 17.91 | 2.19 | 1.62 | 1.67 |
+| lax.ntt + bit_reverse | q58 | 19.78 | 2.60 | 2.16 | 2.91 |
+| RnsRing.ntt (take) | q58 | 18.40 | 2.84 | 2.23 | 2.31 |
+| lax.ntt raw fwd | q42 | 19.52 | 2.05 | 1.48 | 1.56 |
+| lax.ntt raw inv | q42 | 20.51 | 2.18 | 1.63 | 1.67 |
+| lax.ntt + bit_reverse | q42 | 23.06 | 2.58 | 2.15 | 2.91 |
+| RnsRing.ntt (take) | q42 | 22.41 | 2.84 | 2.23 | 2.29 |
+
+Poly (a*b), 25-limb FGb-shaped ring: 0.955 ms/product, 75 transforms -> 12.73 us/NTT amortized (includes pointwise mul + per-limb dispatch)
