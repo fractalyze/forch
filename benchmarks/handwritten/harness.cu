@@ -98,6 +98,9 @@ int main(int argc, char** argv) {
     CUDA_OK(cudaMemcpy(out.data(), data, n * sizeof(u64), cudaMemcpyDeviceToHost));
     rc |= compare((dir + " roundtrip").c_str(), out, input, q);
   } else {  // bench: batch sweep, tiling the golden input
+    cudaEvent_t e0, e1;
+    CUDA_OK(cudaEventCreate(&e0));
+    CUDA_OK(cudaEventCreate(&e1));
     const int sweep[] = {1, 16, 64, 256};
     for (int b : sweep) {
       const size_t bn = (size_t)b * d;
@@ -115,8 +118,6 @@ int main(int argc, char** argv) {
         const Tables* tb = dir_i ? &tb_i : &tb_f;
         for (int w = 0; w < 5; ++w) run(big, tb, b, 0);
         CUDA_OK(cudaDeviceSynchronize());
-        cudaEvent_t e0, e1;
-        CUDA_OK(cudaEventCreate(&e0)); CUDA_OK(cudaEventCreate(&e1));
         const int reps = 30;
         CUDA_OK(cudaEventRecord(e0));
         for (int r = 0; r < reps; ++r) run(big, tb, b, 0);
@@ -127,10 +128,11 @@ int main(int argc, char** argv) {
         double us_call = ms * 1000.0 / reps;
         printf("%s %s batch %3d  %9.2f us/call  %7.3f us/NTT\n", dir.c_str(),
                dir_i ? "inv" : "fwd", b, us_call, us_call / b);
-        CUDA_OK(cudaEventDestroy(e0)); CUDA_OK(cudaEventDestroy(e1));
       }
       CUDA_OK(cudaFree(big));
     }
+    CUDA_OK(cudaEventDestroy(e0));
+    CUDA_OK(cudaEventDestroy(e1));
   }
   return rc;
 }

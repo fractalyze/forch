@@ -103,8 +103,8 @@ __device__ __forceinline__ void intt256_warp(u64 v[8], const Tables& tb, u64 bas
   }
 }
 
-__device__ __forceinline__ u64 reduce4q(u64 x, u64 q, u64 two_q) {
-  if (x >= two_q) x -= two_q;
+__device__ __forceinline__ u64 reduce4q(u64 x, u64 q) {
+  if (x >= 2 * q) x -= 2 * q;
   if (x >= q) x -= q;
   return x;
 }
@@ -160,8 +160,8 @@ __global__ void chunk_kernel(u64* data, Tables tb) {
   for (unsigned r = 0; r < 8; ++r) v[r] = chunk[lane + 32u * r];
   if (kForward) {
     ntt256_warp(v, tb, 256u + c);
-    const u64 two_q = 2 * tb.q;  // final forward phase: reduce to [0, q)
-    for (unsigned r = 0; r < 8; ++r) v[r] = reduce4q(v[r], tb.q, two_q);
+    // Final forward phase: reduce to canonical [0, q).
+    for (unsigned r = 0; r < 8; ++r) v[r] = reduce4q(v[r], tb.q);
   } else {
     intt256_warp(v, tb, 256u + c);  // first inverse phase: stay lazy [0, 2q)
   }

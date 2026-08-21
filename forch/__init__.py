@@ -74,6 +74,15 @@ class Poly:
         self._as_coeff()
         return self
 
+    # Public container access — the documented trace boundary. A jitted
+    # function takes/returns these pytrees; Poly is rebuilt inside via
+    # `Poly(ring, coeff=...)`.
+    def as_coeff(self) -> _ring.Coeff:
+        return self._as_coeff()
+
+    def as_eval(self) -> _ring.Eval:
+        return self._as_eval()
+
     # -- arithmetic ------------------------------------------------------
     def __mul__(self, other: "Poly") -> "Poly":
         self._same_ring(other)

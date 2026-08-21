@@ -11,6 +11,12 @@ import numpy as np
 from lattice_frx.host_ring import HostRnsRing
 from lattice_frx.roots import bit_reverse, prime_factors, primitive_root
 
+# The kernel is hard-wired to d = 2^16 (the 2^8 x 2^8 split); goldens for any
+# other degree would silently gate nothing.
+D = 1 << 16
+
+# The benchmark parameter set. ntt_bench.py imports CASES from here so the two
+# halves of the comparison table can never drift apart.
 CASES = {  # OpenFHE-default (60/50) and HEaaN-FGb (58/42) shapes, all ≡ 1 mod 2^17
     "q60": 1152921504606584833,  # LastPrime(60, 2^17) = 2^60 - 2^18 + 1
     "q50": 1125899908022273,     # FirstPrime(50, 2^17)
@@ -29,9 +35,12 @@ def dump(out: pathlib.Path, q: int, d: int, batch: int, seed: int) -> None:
     psi = pow(g, (q - 1) // (2 * d), q)
     psi_inv = pow(psi, q - 2, q)
     t, tinv = [0] * d, [0] * d
+    cur, cur_inv = 1, 1  # running products: one modmul per index, not a modexp
     for i in range(d):
-        t[bit_reverse(i, logn)] = pow(psi, i, q)
-        tinv[bit_reverse(i, logn)] = pow(psi_inv, i, q)
+        t[bit_reverse(i, logn)] = cur
+        tinv[bit_reverse(i, logn)] = cur_inv
+        cur = cur * psi % q
+        cur_inv = cur_inv * psi_inv % q
     host = HostRnsRing([q], d)
     rng = np.random.default_rng(seed)
     x = rng.integers(0, q, (batch, d), dtype=np.uint64)
@@ -58,10 +67,9 @@ def dump(out: pathlib.Path, q: int, d: int, batch: int, seed: int) -> None:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--out", default=str(pathlib.Path(__file__).parent / "golden"))
-    p.add_argument("--d", type=int, default=1 << 16)
     p.add_argument("--batch", type=int, default=4)
     args = p.parse_args()
     for name, q in CASES.items():
-        assert (q - 1) % (2 * args.d) == 0, name
-        dump(pathlib.Path(args.out) / name, q, args.d, args.batch, seed=42)
+        assert (q - 1) % (2 * D) == 0, name
+        dump(pathlib.Path(args.out) / name, q, D, args.batch, seed=42)
         print("wrote", name)

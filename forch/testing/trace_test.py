@@ -21,7 +21,7 @@ class TraceTest(absltest.TestCase):
         self.ring = forch.Ring([Q60], D)
         rng = np.random.default_rng(3)
         self.ca, self.cb, self.cc = (
-            self.ring.poly(rng.integers(0, Q60, (1, D), dtype=np.uint64))._coeff
+            self.ring.poly(rng.integers(0, Q60, (1, D), dtype=np.uint64)).as_coeff()
             for _ in range(3)
         )
 
@@ -34,7 +34,7 @@ class TraceTest(absltest.TestCase):
 
     def test_mul_is_three_transforms(self):
         def f(a, b):
-            return (self._p(a) * self._p(b))._as_coeff().limbs
+            return (self._p(a) * self._p(b)).as_coeff().limbs
 
         self.assertEqual(self._ntt_count(f, self.ca, self.cb), 3)
 
@@ -46,10 +46,10 @@ class TraceTest(absltest.TestCase):
         # Coeff) would make THIS terminal expression 3 instead of 4 but pay
         # an extra transform on every (sum * e) continuation.
         def mul_only(a, b):
-            return (self._p(a) * self._p(b))._as_coeff().limbs
+            return (self._p(a) * self._p(b)).as_coeff().limbs
 
         def mul_then_add(a, b, c):
-            return ((self._p(a) * self._p(b)) + self._p(c))._as_coeff().limbs
+            return ((self._p(a) * self._p(b)) + self._p(c)).as_coeff().limbs
 
         self.assertEqual(
             self._ntt_count(mul_then_add, self.ca, self.cb, self.cc),
@@ -59,13 +59,13 @@ class TraceTest(absltest.TestCase):
     def test_reuse_transforms_once(self):
         def reuse(a, b):
             pa, pb = self._p(a), self._p(b)
-            return ((pa * pb) + (pa * pb))._as_coeff().limbs  # pa/pb NTT'd once
+            return ((pa * pb) + (pa * pb)).as_coeff().limbs  # pa/pb NTT'd once
 
         self.assertEqual(self._ntt_count(reuse, self.ca, self.cb), 2 + 1)
 
     def test_jit_matches_eager(self):
         def f(a, b, c):
-            return ((self._p(a) * self._p(b)) + self._p(c))._as_coeff().limbs
+            return ((self._p(a) * self._p(b)) + self._p(c)).as_coeff().limbs
 
         eager = f(self.ca, self.cb, self.cc)
         jitted = frx.jit(f)(self.ca, self.cb, self.cc)

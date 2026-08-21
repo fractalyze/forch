@@ -83,7 +83,7 @@ The opcode path for the same ring op is ordinary traced Python — the whole
 
 ```python
 print(frx.jit(lambda a, b: (Poly(ring, coeff=a) * Poly(ring, coeff=b))
-              ._as_coeff().limbs).lower(ca, cb).compile().as_text())
+              .as_coeff().limbs).lower(ca, cb).compile().as_text())
 ```
 
 ## Quick start

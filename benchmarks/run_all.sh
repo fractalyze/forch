@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# One quiet-GPU pass of the whole table -> benchmarks/results/<date>-rtx5090/.
+# One quiet-GPU pass of the whole table -> benchmarks/results/<date>-<gpu>/.
 # Refuses to run while another process holds significant VRAM.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits)
+# One line per GPU; gate on the busiest one.
+used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | sort -n | tail -1)
 if [ "$used" -gt 2000 ]; then
   echo "GPU busy (${used} MiB in use) — refusing to record official numbers." >&2
   exit 1
 fi
-R="benchmarks/results/$(date +%F)-rtx5090"
+gpu_slug=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 \
+  | tr '[:upper:] ' '[:lower:]-' | sed 's/nvidia-//;s/geforce-//')
+R="benchmarks/results/$(date +%F)-${gpu_slug}"
 mkdir -p "$R"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader > "$R/machine.txt"
-( cd benchmarks/handwritten && make -s ntt_bench && ./ntt_bench golden/q60 check >/dev/null && make -s bench ) > "$R/handwritten.txt"
-XLA_PYTHON_CLIENT_PREALLOCATE=false .venv/bin/python benchmarks/ntt_bench.py 2>/dev/null > "$R/opcode.txt"
+# Byte-exactness gates ALL cases before any number is recorded.
+make -s -C benchmarks/handwritten ntt_bench check
+( cd benchmarks/handwritten && make -s bench ) > "$R/handwritten.txt"
+XLA_PYTHON_CLIENT_PREALLOCATE=false .venv/bin/python benchmarks/ntt_bench.py \
+  > "$R/opcode.txt" 2> "$R/opcode.stderr.log" || { cat "$R/opcode.stderr.log" >&2; exit 1; }
 echo "wrote $R"

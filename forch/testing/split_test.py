@@ -25,9 +25,12 @@ def tables(q):
     psi = pow(g, (q - 1) // (2 * N), q)
     psi_inv = pow(psi, q - 2, q)
     t, tinv = [0] * N, [0] * N
+    cur, cur_inv = 1, 1  # running products: one modmul per index, not a modexp
     for i in range(N):
-        t[bit_reverse(i, LOGN)] = pow(psi, i, q)
-        tinv[bit_reverse(i, LOGN)] = pow(psi_inv, i, q)
+        t[bit_reverse(i, LOGN)] = cur
+        tinv[bit_reverse(i, LOGN)] = cur_inv
+        cur = cur * psi % q
+        cur_inv = cur_inv * psi_inv % q
     return t, tinv
 
 
@@ -58,12 +61,14 @@ def gs256(a, tw, q):
 
 
 class SplitTest(absltest.TestCase):
-    def setUp(self):
-        super().setUp()
-        self.host = HostRnsRing([Q], N)
-        self.t, self.tinv = tables(Q)
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Pure functions of module constants; built once for both tests.
+        cls.host = HostRnsRing([Q], N)
+        cls.t, cls.tinv = tables(Q)
         rng = np.random.default_rng(0)
-        self.x = rng.integers(0, Q, N, dtype=np.uint64)
+        cls.x = rng.integers(0, Q, N, dtype=np.uint64)
 
     def test_forward_split(self):
         y = [int(v) for v in self.x]
