@@ -35,6 +35,25 @@ parameter set live there. Rules that gate changes:
   packing temporaries), which is why it is scoped here and not proposed as an
   XLA default — do not add it to unrelated repos' runs without measuring their
   peak memory first.
+- **Limb grouping is the other switch that changes the numbers — but only the
+  `Poly` product's.** An RNS ring element carries one dtype per limb, so no
+  batch axis spans them; xla#569 lets the compiler merge the limbs' NTTs into
+  one dispatch. `benchmarks/ntt_bench.py` asks for it per-computation
+  (`FORCH_NTT_LIMB_GROUP`, default = the ring's limb count) and prints one of
+  three states — `on, max_group=N` / `off by request` / `unavailable (this frx
+  predates xla#569)`. Quote that line with the product's µs/NTT. The sweep
+  table above is single-limb `RnsRing([q], D)` jits with nothing to merge, so
+  it is untouched by this switch; do not annotate those rows with it.
+  - It is a **compile option, never `XLA_FLAGS`** — frxlib parses `XLA_FLAGS`
+    against its own built-in list and `LOG(FATAL)`s on an unknown flag, so an
+    older wheel would abort the run, where a compile option degrades to a
+    catchable error the bench falls back from.
+  - It lives in the benchmark for a **harder reason than the command-buffer
+    flag**, which is scoped here by a cost judgment. `compiler_options` is
+    rejected on a nested `jit` (`ValueError: can only be passed to top-level
+    jax.jit`), and `Poly.__mul__` always runs inside the consumer's trace — so
+    `forch/` *cannot* ask for this, at any cost. Only a top-level caller can.
+    Do not go looking for a peak-memory-style justification; there isn't one.
 - **Benchmarks:** warm, ≥30 reps, `block_until_ready` on a leaf
   (`.limbs[0]`), `XLA_PYTHON_CLIENT_PREALLOCATE=false`. The GPU is shared on
   this machine — `bash benchmarks/run_all.sh` refuses to record while

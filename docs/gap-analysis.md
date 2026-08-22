@@ -33,16 +33,76 @@ product ran strictly in sequence. With
 | `CONCURRENT` | 0.20 ms | 2.6 µs | 114 MiB (2.2×) |
 | limb-batched handwritten (ceiling) | ~0.13 ms | 1.78 µs | — |
 
-So ~5× of the original ~10× was a scheduling flag, and **~2.4× remains** —
-that residue is the limb axis proper (fewer, larger launches), and it is the
-honest target for fractalyze/xla#569. The flag is not proposed as an XLA
-default: it costs 2.2× peak memory because buffer assignment falls back to
+So ~5× of the original ~10× was a scheduling flag, and **~2.4× remained** —
+that residue is the limb axis proper (fewer, larger launches). It was the
+target of fractalyze/xla#569, which is now **merged and measured**; see the
+update below. The flag is not proposed as an XLA default: it costs 2.2× peak memory because buffer assignment falls back to
 `DependencyHloOrdering` and stops packing temporaries. Upstream defaulted it
 on in July 2025 and reverted the same day.
+
+## Update 2026-08-22 (later): the limb axis is closed — the glue is not
+
+fractalyze/xla#569 landed (`f7e9504`): the compiler now merges an RNS
+ciphertext's independent same-geometry NTT passes into one multi-root dispatch
+of k grid-z planes, one monomorphic transform body per limb. `ntt_bench.py`
+asks for it (`FORCH_NTT_LIMB_GROUP`); it needs an frx carrying that xla.
+
+Same card and parameters as above, `nsys --cuda-graph-trace=node`, GPU-busy =
+the union of kernel intervals per iteration. Kernel-sum is the wrong statistic
+for the ungrouped row — its 50 kernels overlap heavily under CONCURRENT (172 µs
+of kernel time inside 45.6 µs of busy time), which is exactly what that flag
+buys.
+
+Forward pass, 25 transforms:
+
+| | kernels | GPU busy | µs/NTT |
+|---|---|---|---|
+| before (per-limb dispatch) | 50 | 45.63 µs | 1.825 |
+| grouped (`limbs=25`) | 2 | 26.14 µs | 1.045 |
+| batched `lax.ntt` `[25, 2^16]`, one modulus | 2 | 26.01 µs | 1.041 |
+
+**The generated kernel lands on the single-modulus batched bar to within
+0.4%.** Given the limbs in one call, codegen was never the problem — the whole
+residue was launch count.
+
+The 25-limb product, 75 transforms, split by kernel:
+
+| | NTT busy | elementwise busy | total | #ntt | #other |
+|---|---|---|---|---|---|
+| before | 215.43 µs | 174.78 | 215.59 µs | 150 | 100 |
+| grouped | 132.80 µs | 70.74 | 179.81 µs | **6** | 100 |
+| batched, one modulus | 100.79 µs | 6.65 | 107.38 µs | 6 | 1 |
+
+**Delta 1 below is resolved.** Its issue-draft acceptance criterion — "25-limb
+product within 1.5× of the equal-traffic single-modulus batched call" — is met
+by the transforms at **1.32×** (150 fusions → 6, 215.4 → 132.8 µs, 1.62×).
+Byte-identical per limb, verified against the ungrouped path on the real
+58/42-bit prime set.
+
+**What it exposed.** The product as a whole only improves 1.20× and sits at
+1.67× the bar, because the residue is no longer the NTT: it is the other 100
+kernels — the per-limb *pointwise multiply*, 70.74 µs against the batched
+reference's 6.65 µs for one fused elementwise op. That is this document's
+thesis restated one op over: a ring element carries one dtype per limb, so
+every elementwise op over it is one kernel per limb too. It is filed as
+measured context on xla#168 (NTT is a hard fusion boundary — adjacent
+elementwise won't fuse in), whose `pre=`/`post=` boundary-op fold is the
+mechanism that should absorb them. Two things block that today: the fold is
+not firing for this shape at all (the ungrouped row already shows 100 separate
+elementwise kernels), and it cannot compose with grouping — the fold's scale
+operands sit at fixed positions that the per-limb `[k data, k twiddles]`
+layout displaces, so the parser rejects the combination.
+
+**Next largest item on this page is now delta 2**, the order adapter.
 
 ## The deltas, largest first
 
 ### 1. Per-limb dispatch: ~13 µs vs 1.33 µs amortized (~10×) — the real gap
+
+> **Resolved 2026-08-22** by fractalyze/xla#569 (`f7e9504`); the numbers below
+> are the diagnosis that motivated it, kept because the reasoning still holds.
+> The shipped mechanism differs from the ask — grouping already-lowered
+> per-limb fusions, not a new multi-modulus op. See the later update above.
 
 `RnsRing` carries one dtype per limb (`prime_field(q_i)`), so a 25-limb
 product issues 75 batch-1 `lax.ntt` calls; a batch-1 NTT is latency-bound at
@@ -56,7 +116,7 @@ with per-limb algebraic types (or a stacked-modulus type), lowering to one
 fused `ntt_pass` chain whose twiddle constant carries all limbs' tables.
 Recovers ~10× on ring-element products at CKKS limb counts, which is the
 shape every consumer (jindo commit, future forch mult/key-switch) actually
-runs. This is the highest-value item on the list.
+runs. This was the highest-value item on the list.
 
 ### 2. Order adapter: 2.23 → 1.35 µs (1.65×) against the contract order
 
@@ -102,15 +162,16 @@ table layout, so the companion row is one more precompute.
 
 ## Issue drafts
 
-Drafts to file (pending owner's go-ahead), self-contained per playbook §11:
+Self-contained per playbook §11. Struck-through items have shipped; the
+rest are still drafts pending the owner's go-ahead.
 
-1. **xla: batch the RNS limb axis through one NTT call** — problem: per-limb
-   dtypes force batch-1 NTTs; measured ~20 µs/NTT batch-1 vs 1.35–1.64 µs
-   batched on RTX 5090 at d=2^16; a 25-limb product amortizes to 12.7 µs/NTT.
-   Sketch: accept `[limbs, ..., d]` with a per-limb modulus list on the type
-   or a new stacked type; twiddle constant becomes `[limbs, table]`; grid
-   flattens `limbs × batch`. Acceptance: 25-limb product within 1.5× of the
-   equal-traffic single-modulus batched call.
+1. ~~**xla: batch the RNS limb axis through one NTT call**~~ — **DONE.** Filed
+   as fractalyze/xla#569, merged as `f7e9504`. The shipped form is not the
+   sketch here (no new stacked type, no `[limbs, ..., d]` shape): the rewriter
+   groups the already-lowered per-limb `ntt_pass` fusions into one multi-root
+   fusion and the emitter monomorphizes a body per limb behind a grid-z switch,
+   which needs no frontend or type-system change at all. Acceptance criterion
+   met at 1.32× (bar: 1.5×) — see the 2026-08-22 update above.
 2. **xla: native bit-reversed order for the negacyclic NTT** — problem: the
    FHE/lattigo contract order costs a gather (2.23 µs total) or an extra
    kernel (2.15 µs) against 1.64 µs raw; CT-DIT with ψ^brev tables emits

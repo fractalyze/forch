@@ -65,6 +65,14 @@ custom kernels around it.
   force one batch-1 transform per limb, and XLA's default command-buffer mode
   serializes them even though nothing connects them. Full attribution in
   [docs/gap-analysis.md](docs/gap-analysis.md).
+- **The transform half of that is now closed upstream.**
+  [fractalyze/xla#569](https://github.com/fractalyze/xla/issues/569) merged the
+  limb axis into one dispatch: 150 transform dispatches → 6, NTT device time
+  215.4 → 132.8 µs, landing within 0.4% of an equal-traffic single-modulus
+  batched call — given the limbs in one call, the generated kernel *matches*
+  the batched one. What remains is the per-limb **pointwise** ops, the same
+  one-dtype-per-limb problem one op over. Needs an frx carrying that xla;
+  the bench asks for it and prints which state it got.
 
 ### One flag moves the headline number 5×
 
