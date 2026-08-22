@@ -25,6 +25,16 @@ parameter set live there. Rules that gate changes:
   embedding, by lattice-frx design). Inside `frx.jit`, pass `Coeff`/`Eval`
   pytrees and build `Poly(ring, coeff=...)`. Domain policy: disjoint-domain
   add meets in Eval (see `trace_test.py` for the rationale).
+- **The command-buffer mode is part of every number.** XLA's default (`LHS`)
+  serializes independent fusions, so the 25-limb product reads 12.8 µs/NTT
+  under it and 2.6 µs/NTT under
+  `--xla_gpu_command_buffer_scheduling_mode=CONCURRENT` — a 5× swing.
+  `benchmarks/ntt_bench.py` sets the flag itself (override with
+  `FORCH_COMMAND_BUFFER_MODE`); never quote a number without saying which mode
+  produced it. The flag costs ~2.2× peak memory (buffer assignment stops
+  packing temporaries), which is why it is scoped here and not proposed as an
+  XLA default — do not add it to unrelated repos' runs without measuring their
+  peak memory first.
 - **Benchmarks:** warm, ≥30 reps, `block_until_ready` on a leaf
   (`.limbs[0]`), `XLA_PYTHON_CLIENT_PREALLOCATE=false`. The GPU is shared on
   this machine — `bash benchmarks/run_all.sh` refuses to record while

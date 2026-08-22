@@ -19,6 +19,27 @@ NOT retain the 32 MB intermediate at batch 64 — apparent per-kernel bandwidth
 never exceeds DRAM peak), so its floor is 1.12 µs/NTT. The handwritten
 kernels sit at 97% (contiguous phase) and 79% (strided phase) of peak.
 
+## Update 2026-08-22: most of the gap was scheduling, not codegen
+
+The per-limb dispatch cost below is real, but its cause was not what this
+document first claimed. XLA's default command-buffer mode (`LHS`) makes each
+command depend on the previous one, so the 75 independent NTTs of a 25-limb
+product ran strictly in sequence. With
+`--xla_gpu_command_buffer_scheduling_mode=CONCURRENT`:
+
+| | 25-limb product | per NTT | peak memory |
+|---|---|---|---|
+| default (`LHS`) | 0.96 ms | 12.8 µs | 51 MiB |
+| `CONCURRENT` | 0.20 ms | 2.6 µs | 114 MiB (2.2×) |
+| limb-batched handwritten (ceiling) | ~0.13 ms | 1.78 µs | — |
+
+So ~5× of the original ~10× was a scheduling flag, and **~2.4× remains** —
+that residue is the limb axis proper (fewer, larger launches), and it is the
+honest target for fractalyze/xla#569. The flag is not proposed as an XLA
+default: it costs 2.2× peak memory because buffer assignment falls back to
+`DependencyHloOrdering` and stops packing temporaries. Upstream defaulted it
+on in July 2025 and reverted the same day.
+
 ## The deltas, largest first
 
 ### 1. Per-limb dispatch: ~13 µs vs 1.33 µs amortized (~10×) — the real gap
