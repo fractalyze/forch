@@ -33,27 +33,10 @@ os.environ["XLA_FLAGS"] = (
     + f" --xla_gpu_command_buffer_scheduling_mode={_MODE}"
 ).strip()
 
-# Limb grouping (fractalyze/xla#569). An RNS ring element carries one
-# prime_field(q_i) dtype per limb, so no tensor axis can span the limbs and each
-# limb's transform is its own dispatch. Above 1, the compiler merges independent
-# same-geometry NTT passes into one multi-root dispatch of k grid-z planes.
-# Measured on the 25-limb product below (RTX 5090, CONCURRENT, nsys GPU-busy):
-# 150 transform dispatches -> 6, NTT device time 215.4 -> 132.8 us, landing at
-# 1.32x an equal-traffic single-modulus batched call. Byte-identical per limb.
-#
-# Passed as a COMPILE OPTION, not through XLA_FLAGS: frxlib parses XLA_FLAGS
-# against the flag list it was built with and calls LOG(FATAL) on an unknown
-# one, so an frx wheel older than the feature would abort every run in this
-# file. As a compile option the same wheel returns a catchable
-# "No such compile option", which is what the fallback below reads -- so this
-# runs on any wheel and switches itself on once frx carries an xla >= f7e9504.
-_LIMB_GROUP = int(os.environ.get("FORCH_NTT_LIMB_GROUP", "64"))
-
 import numpy as np
 
 import forch
 import frx
-import frx.errors
 import frx.numpy as fnp
 import zk_dtypes
 from frx import lax
@@ -94,23 +77,55 @@ def bench(fn, *args, reps: int) -> float:
     return (time.perf_counter() - t0) / reps
 
 
-def jit_limb_grouped(fn, *example_args):
-    """`frx.jit(fn)` with limb grouping on, or plain jit when frx predates it.
+# Limb grouping (fractalyze/xla#569). An RNS ring element carries one
+# prime_field(q_i) dtype per limb, so no tensor axis can span the limbs and each
+# limb's transform is its own dispatch. Above 1, the compiler merges independent
+# same-geometry NTT passes into one multi-root dispatch of k grid-z planes.
+# Measured on the 25-limb product (RTX 5090, CONCURRENT, nsys GPU-busy): 150
+# transform dispatches -> 6, NTT device time 215.4 -> 132.8 us, landing at 1.32x
+# an equal-traffic single-modulus batched call. Byte-identical per limb, and the
+# full attribution is in docs/gap-analysis.md.
+#
+# Asked for as a COMPILE OPTION, never through XLA_FLAGS: frxlib parses
+# XLA_FLAGS against the flag list it was built with and calls LOG(FATAL) on an
+# unknown one, so an frx older than the feature would abort every run in this
+# file. As a compile option the same frx returns a catchable "No such compile
+# option", so this runs on any wheel and switches itself on once frx carries an
+# xla >= f7e9504.
+_LIMB_GROUP_ENV = os.environ.get("FORCH_NTT_LIMB_GROUP")
 
-    Returns `(compiled, grouped)`; `grouped` says which of the two produced the
-    numbers, since the repo's rule is never to quote one without the mode.
+
+def compile_limb_grouped(fn, *example_args, limbs: int):
+    """`fn` compiled with limb grouping, and the state to quote alongside it.
+
+    Returns `(compiled, state)`. `state` is the line the caller prints: the
+    repo's rule is never to quote a number without the switch that produced it,
+    and there are three states to tell apart, not two -- asked for and got it,
+    asked for and this frx is too old, and deliberately turned off.
+
+    The cap defaults to the ring's own limb count rather than a constant: that
+    is the largest group this shape can ever form, so it never binds, and it
+    stays honest when the CKKS layers push the limb count up.
     """
-    if _LIMB_GROUP > 1:
-        opts = {"xla_gpu_ntt_max_fusion_group": _LIMB_GROUP}
-        try:
-            compiled = frx.jit(fn, compiler_options=opts)
-            # Force the compile here: jit is lazy, and an frx that does not know
-            # the option only says so when it first compiles.
-            compiled.lower(*example_args).compile(compiler_options=opts)
-            return compiled, True
-        except frx.errors.JaxRuntimeError:
-            pass
-    return frx.jit(fn), False
+    group = int(_LIMB_GROUP_ENV) if _LIMB_GROUP_ENV else limbs
+    # One lowering serves both branches, and the compile below is the only one
+    # the run pays -- the caller times this executable directly. Passing the
+    # option to BOTH jit() and compile() would duplicate the kv pair, miss the
+    # executable cache, and silently compile the graph a second time.
+    lowered = frx.jit(fn).lower(*example_args)
+    if group < 2:
+        return lowered.compile(), f"off by request (FORCH_NTT_LIMB_GROUP={group})"
+    try:
+        compiled = lowered.compile(
+            compiler_options={"xla_gpu_ntt_max_fusion_group": group})
+    except frx.errors.JaxRuntimeError as e:
+        # Only the "frx predates the feature" case falls back. An OOM or a
+        # compiler bug must not be recorded as a slower-but-valid number under
+        # a line blaming the wheel's age.
+        if "No such compile option" not in str(e):
+            raise
+        return lowered.compile(), "unavailable (this frx predates xla#569)"
+    return compiled, f"on, max_group={group}"
 
 
 def opcode_paths(q: int):
@@ -140,6 +155,8 @@ def main() -> None:
     print(f"# frx {frx.__version__}, {frx.devices()}, d = 2^16, {reps} reps warm")
     print(f"# command-buffer scheduling mode: {_MODE}"
           f"  (XLA default is LHS; see the note at the top of this file)")
+    requested = _LIMB_GROUP_ENV or "the ring's limb count"
+    print(f"# limb grouping (Poly product only): {requested} requested")
     print("\n| path | prime | " + " | ".join(f"batch {b}" for b in BATCHES) + " |")
     print("|---" * (len(BATCHES) + 2) + "|")
     rng = np.random.default_rng(0)
@@ -163,25 +180,23 @@ def main() -> None:
     ca = ring.poly(np.stack([rng.integers(0, q, D, dtype=np.uint64) for q in qs])).as_coeff()
     cb = ring.poly(np.stack([rng.integers(0, q, D, dtype=np.uint64) for q in qs])).as_coeff()
 
+    # Returns the Coeff pytree rather than its .limbs so `bench` can pick the
+    # leaf it blocks on, the same way the sweep's paths do.
     def product(a, b):
-        return (forch.Poly(ring, coeff=a) * forch.Poly(ring, coeff=b)).as_coeff().limbs
+        return (forch.Poly(ring, coeff=a) * forch.Poly(ring, coeff=b)).as_coeff()
 
-    f, grouped = jit_limb_grouped(product, ca, cb)
-    y = f(ca, cb); y[0].block_until_ready()
-    t0 = time.perf_counter()
-    for _ in range(reps):
-        y = f(ca, cb)
-    y[0].block_until_ready()
-    dt = (time.perf_counter() - t0) / reps
+    f, grouping = compile_limb_grouped(product, ca, cb, limbs=len(qs))
+    dt = bench(f, ca, cb, reps=reps)
     n_transforms = 3 * len(qs)
     peak = frx.local_devices()[0].memory_stats().get("peak_bytes_in_use", 0)
+    # The per-limb parenthetical stops being true once the limbs share a
+    # dispatch, so say which one this run measured.
+    dispatch = "one dispatch per pass" if grouping.startswith("on") else \
+        "per-limb dispatch"
     print(f"\nPoly (a*b), {len(qs)}-limb FGb-shaped ring: {dt*1e3:.3f} ms/product, "
           f"{n_transforms} transforms -> {dt/n_transforms*1e6:.2f} us/NTT amortized "
-          f"(includes pointwise mul + per-limb dispatch)")
-    print("limb grouping: "
-          + (f"on, max_group={_LIMB_GROUP}" if grouped else
-             "OFF -- this frx predates xla#569, so each limb is still its own "
-             "dispatch; upgrade frx to collapse them"))
+          f"(includes pointwise mul + {dispatch})")
+    print(f"limb grouping: {grouping}")
     # Process-wide peak, i.e. across the whole sweep above, not the product
     # alone — for the isolated 51 vs 114 MiB comparison see docs/gap-analysis.md.
     print(f"peak device memory this process: {peak/2**20:.1f} MiB "
