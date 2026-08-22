@@ -35,6 +35,16 @@ parameter set live there. Rules that gate changes:
   packing temporaries), which is why it is scoped here and not proposed as an
   XLA default — do not add it to unrelated repos' runs without measuring their
   peak memory first.
+- **Limb grouping is the other switch that changes the numbers.** An RNS ring
+  element carries one dtype per limb, so no batch axis spans them; xla#569 lets
+  the compiler merge the limbs' NTTs into one dispatch, and
+  `benchmarks/ntt_bench.py` asks for it per-computation
+  (`FORCH_NTT_LIMB_GROUP`, default 64). It is a **compile option, never
+  `XLA_FLAGS`** — frxlib parses `XLA_FLAGS` against its own built-in list and
+  `LOG(FATAL)`s on an unknown flag, so an older wheel would abort the run;
+  as a compile option it degrades to a catchable error and the bench falls back
+  with `limb grouping: OFF` on the output. Quote that line with any per-NTT
+  number, the same way the command-buffer mode is quoted.
 - **Benchmarks:** warm, ≥30 reps, `block_until_ready` on a leaf
   (`.limbs[0]`), `XLA_PYTHON_CLIENT_PREALLOCATE=false`. The GPU is shared on
   this machine — `bash benchmarks/run_all.sh` refuses to record while
