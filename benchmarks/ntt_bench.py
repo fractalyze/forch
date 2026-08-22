@@ -10,9 +10,28 @@ Methodology: warm, 30 reps, block_until_ready on a leaf array. GPU may be
 shared on this machine — check nvidia-smi before believing a slow number.
 """
 import argparse
+import os
 import pathlib
 import sys
 import time
+
+# XLA's default command-buffer mode (LHS) serializes independent fusions, which
+# costs ~5x on an RNS workload: every limb's NTT waits for the previous one even
+# though nothing connects them. CONCURRENT lets the CUDA graph's buffer-conflict
+# DAG run them in parallel. Set before the backend initializes, and set here
+# rather than documented, so a forgotten env var cannot silently publish a 5x
+# regression as a measurement.
+#
+# The cost is real and is why this is not XLA's default: buffer assignment falls
+# back to DependencyHloOrdering, whole-module heap simulation is skipped, and
+# peak memory rises (measured 2.24x here, 51 -> 114 MiB). That is harmless at FHE
+# sizes on a 32 GB card and would not be on a memory-bound prover, so the flag
+# stays scoped to this benchmark instead of being pushed upstream as a default.
+_MODE = os.environ.get("FORCH_COMMAND_BUFFER_MODE", "CONCURRENT")
+os.environ["XLA_FLAGS"] = (
+    os.environ.get("XLA_FLAGS", "")
+    + f" --xla_gpu_command_buffer_scheduling_mode={_MODE}"
+).strip()
 
 import numpy as np
 
@@ -83,6 +102,8 @@ def main() -> None:
     reps = args.reps
 
     print(f"# frx {frx.__version__}, {frx.devices()}, d = 2^16, {reps} reps warm")
+    print(f"# command-buffer scheduling mode: {_MODE}"
+          f"  (XLA default is LHS; see the note at the top of this file)")
     print("\n| path | prime | " + " | ".join(f"batch {b}" for b in BATCHES) + " |")
     print("|---" * (len(BATCHES) + 2) + "|")
     rng = np.random.default_rng(0)
@@ -117,9 +138,14 @@ def main() -> None:
     y[0].block_until_ready()
     dt = (time.perf_counter() - t0) / reps
     n_transforms = 3 * len(qs)
+    peak = frx.local_devices()[0].memory_stats().get("peak_bytes_in_use", 0)
     print(f"\nPoly (a*b), {len(qs)}-limb FGb-shaped ring: {dt*1e3:.3f} ms/product, "
           f"{n_transforms} transforms -> {dt/n_transforms*1e6:.2f} us/NTT amortized "
           f"(includes pointwise mul + per-limb dispatch)")
+    # Process-wide peak, i.e. across the whole sweep above, not the product
+    # alone — for the isolated 51 vs 114 MiB comparison see docs/gap-analysis.md.
+    print(f"peak device memory this process: {peak/2**20:.1f} MiB "
+          f"(mode {_MODE}; CONCURRENT trades ~2.2x peak for the overlap)")
 
 
 if __name__ == "__main__":

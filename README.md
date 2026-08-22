@@ -58,10 +58,33 @@ custom kernels around it.
   170 SMs) — batch ≥ 16 is the honest CKKS regime, since a ciphertext is
   dozens of limbs. Published context: Phantom ≈1.5 µs/limb and GPU-NTT
   8.7 µs single on an RTX 4090 (1,008 GB/s).
-- A 25-limb (HEaaN-FGb-shaped) `Poly` product amortizes to **12.7 µs/NTT**
-  today: per-limb dtypes force batch-1 transforms. That ~10× — not the ~20%
-  butterfly arithmetic — is the real opcode-vs-handwritten gap, and the top
-  item in [docs/gap-analysis.md](docs/gap-analysis.md).
+- A 25-limb (HEaaN-FGb-shaped) `Poly` product amortizes to **12.8 µs/NTT**
+  under XLA's default scheduling and **2.6 µs/NTT** with concurrent command
+  buffers (`benchmarks/ntt_bench.py` sets that itself — see below). The gap is
+  the *number of kernel launches*, not butterfly arithmetic: per-limb dtypes
+  force one batch-1 transform per limb, and XLA's default command-buffer mode
+  serializes them even though nothing connects them. Full attribution in
+  [docs/gap-analysis.md](docs/gap-analysis.md).
+
+### One flag moves the headline number 5×
+
+XLA's default command-buffer mode (`LHS`) makes every command depend on the
+previous one, so 75 independent NTTs run strictly in sequence. Setting
+`--xla_gpu_command_buffer_scheduling_mode=CONCURRENT` lets the CUDA graph's
+buffer-conflict DAG overlap them:
+
+| | 25-limb product | per NTT | peak memory |
+|---|---|---|---|
+| default (`LHS`) | 0.96 ms | 12.8 µs | 51 MiB |
+| `CONCURRENT` | **0.20 ms** | **2.6 µs** | 114 MiB (2.2×) |
+
+`benchmarks/ntt_bench.py` sets it in-process rather than documenting it, so a
+forgotten environment variable cannot publish a 5× regression as a
+measurement; `FORCH_COMMAND_BUFFER_MODE=LHS` overrides it, and
+`benchmarks/run_all.sh` records both. It is deliberately *not* proposed as an
+XLA default: it costs ~2.2× peak memory (buffer assignment stops packing
+temporaries), which is free at FHE sizes and would not be on a memory-bound
+prover. Upstream tried defaulting it on and reverted the same day.
 
 ## The code, side by side
 
