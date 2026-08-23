@@ -71,8 +71,10 @@ custom kernels around it.
   215.4 → 132.8 µs, landing within 0.4% of an equal-traffic single-modulus
   batched call — given the limbs in one call, the generated kernel *matches*
   the batched one. What remains is the per-limb **pointwise** ops, the same
-  one-dtype-per-limb problem one op over. Needs an frx carrying that xla;
-  the bench asks for it and prints which state it got.
+  one-dtype-per-limb problem one op over. Needs an frx carrying that xla —
+  [xla#579](https://github.com/fractalyze/xla/pull/579) then made grouping the
+  backend default, so nothing has to ask for it; the bench prints which state
+  it got.
 
 ### One flag moves the headline number 5×
 
