@@ -44,8 +44,13 @@ on in July 2025 and reverted the same day.
 
 fractalyze/xla#569 landed (`f7e9504`): the compiler now merges an RNS
 ciphertext's independent same-geometry NTT passes into one multi-root dispatch
-of k grid-z planes, one monomorphic transform body per limb. `ntt_bench.py`
-asks for it (`FORCH_NTT_LIMB_GROUP`); it needs an frx carrying that xla.
+of k grid-z planes, one monomorphic transform body per limb. It shipped gated
+at `xla_gpu_ntt_max_fusion_group=1`; **fractalyze/xla#579 (`4e52227`) then made
+grouping the default**, after measuring that it never fires on the zk provers'
+shapes and that module PTX falls as the group grows rather than rising. So this
+needs an frx carrying that xla and nothing more — `ntt_bench.py` still sends
+the value (`FORCH_NTT_LIMB_GROUP`) to pin what it measured and to allow the
+off-switch A/B, not to enable it.
 
 Same card and parameters as above, `nsys --cuda-graph-trace=node`, GPU-busy =
 the union of kernel intervals per iteration. Kernel-sum is the wrong statistic

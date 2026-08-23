@@ -86,35 +86,42 @@ def bench(fn, *args, reps: int) -> float:
 # an equal-traffic single-modulus batched call. Byte-identical per limb, and the
 # full attribution is in docs/gap-analysis.md.
 #
-# Asked for as a COMPILE OPTION, never through XLA_FLAGS: frxlib parses
-# XLA_FLAGS against the flag list it was built with and calls LOG(FATAL) on an
-# unknown one, so an frx older than the feature would abort every run in this
-# file. As a compile option the same frx returns a catchable "No such compile
-# option", so this runs on any wheel and switches itself on once frx carries an
-# xla >= f7e9504.
+# Since fractalyze/xla#579 grouping is the backend's DEFAULT; the option below
+# pins the value rather than enabling it.
+#
+# Sent as a COMPILE OPTION, never through XLA_FLAGS: frxlib parses XLA_FLAGS
+# against the flag list it was built with and calls LOG(FATAL) on an unknown
+# one, so an frx older than the feature would abort every run in this file. As
+# a compile option the same frx returns a catchable "No such compile option",
+# so this runs on any wheel.
 _LIMB_GROUP_ENV = os.environ.get("FORCH_NTT_LIMB_GROUP")
 
 
 def compile_limb_grouped(fn, *example_args, limbs: int):
-    """`fn` compiled with limb grouping, and the state to quote alongside it.
+    """`fn` compiled, and whether the limbs ended up sharing a dispatch.
 
-    Returns `(compiled, state)`. `state` is the line the caller prints: the
-    repo's rule is never to quote a number without the switch that produced it,
-    and there are three states to tell apart, not two -- asked for and got it,
-    asked for and this frx is too old, and deliberately turned off.
+    Returns `(compiled, grouped, state)`. `state` is the line the caller
+    prints -- the repo's rule is never to quote a number without the switch
+    that produced it, and there are three states to tell apart, not two: asked
+    for and got it, asked for and this frx is too old, and deliberately turned
+    off. `grouped` is that same fact as a bool, so callers annotating their
+    output do not have to parse the prose.
 
-    The cap defaults to the ring's own limb count rather than a constant: that
-    is the largest group this shape can ever form, so it never binds, and it
-    stays honest when the CKKS layers push the limb count up.
+    The cap defaults to the ring's own limb count, which pins the measurement
+    to one group per limb set. It is a real cap, not a formality: a *product*
+    presents 2k same-geometry forward transforms (a's limbs and b's), so k
+    holds them to two groups where the backend's own default would form one.
     """
     group = int(_LIMB_GROUP_ENV) if _LIMB_GROUP_ENV else limbs
-    # One lowering serves both branches, and the compile below is the only one
+    # Sent even at group=1: xla#579 made grouping the default, so omitting the
+    # option would silently record a grouped run under an "off by request"
+    # label.
+    #
+    # One lowering serves every branch, and the compile below is the only one
     # the run pays -- the caller times this executable directly. Passing the
     # option to BOTH jit() and compile() would duplicate the kv pair, miss the
     # executable cache, and silently compile the graph a second time.
     lowered = frx.jit(fn).lower(*example_args)
-    if group < 2:
-        return lowered.compile(), f"off by request (FORCH_NTT_LIMB_GROUP={group})"
     try:
         compiled = lowered.compile(
             compiler_options={"xla_gpu_ntt_max_fusion_group": group})
@@ -124,8 +131,11 @@ def compile_limb_grouped(fn, *example_args, limbs: int):
         # a line blaming the wheel's age.
         if "No such compile option" not in str(e):
             raise
-        return lowered.compile(), "unavailable (this frx predates xla#569)"
-    return compiled, f"on, max_group={group}"
+        return (lowered.compile(), False,  # ungrouped whatever `group` asked
+                "unavailable (this frx predates xla#569)")
+    if group < 2:
+        return compiled, False, f"off by request (FORCH_NTT_LIMB_GROUP={group})"
+    return compiled, True, f"on, max_group={group}"
 
 
 def opcode_paths(q: int):
@@ -185,14 +195,13 @@ def main() -> None:
     def product(a, b):
         return (forch.Poly(ring, coeff=a) * forch.Poly(ring, coeff=b)).as_coeff()
 
-    f, grouping = compile_limb_grouped(product, ca, cb, limbs=len(qs))
+    f, grouped, grouping = compile_limb_grouped(product, ca, cb, limbs=len(qs))
     dt = bench(f, ca, cb, reps=reps)
     n_transforms = 3 * len(qs)
     peak = frx.local_devices()[0].memory_stats().get("peak_bytes_in_use", 0)
     # The per-limb parenthetical stops being true once the limbs share a
     # dispatch, so say which one this run measured.
-    dispatch = "one dispatch per pass" if grouping.startswith("on") else \
-        "per-limb dispatch"
+    dispatch = "one dispatch per pass" if grouped else "per-limb dispatch"
     print(f"\nPoly (a*b), {len(qs)}-limb FGb-shaped ring: {dt*1e3:.3f} ms/product, "
           f"{n_transforms} transforms -> {dt/n_transforms*1e6:.2f} us/NTT amortized "
           f"(includes pointwise mul + {dispatch})")
